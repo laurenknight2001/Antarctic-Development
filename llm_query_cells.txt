@@ -1,0 +1,356 @@
+pip install pypdf
+
+
+
+
+import boto3
+import json
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional, Any
+from IPython.display import display, Markdown
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL CATALOGUE
+# Change ACTIVE_MODEL to any key below to swap models instantly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Model(str, Enum):
+    # ── Amazon Nova ───────────────────────────────────────────────────────────
+    NOVA_PREMIER        = "us.amazon.nova-premier-v1:0"
+    NOVA_PRO            = "us.amazon.nova-pro-v1:0"
+    NOVA_LITE           = "us.amazon.nova-lite-v1:0"
+    NOVA_MICRO          = "us.amazon.nova-micro-v1:0"
+    NOVA_2_LITE         = "us.amazon.nova-2-lite-v1:0"
+
+    # ── Anthropic ─────────────────────────────────────────────────────────────
+    CLAUDE_SONNET_4_6   = "us.anthropic.claude-sonnet-4-6"
+    CLAUDE_OPUS_4_6     = "us.anthropic.claude-opus-4-6-v1"
+
+    # ── Meta ──────────────────────────────────────────────────────────────────
+    LLAMA4_MAVERICK_17B = "us.meta.llama4-maverick-17b-instruct-v1:0"
+
+    # ── Mistral ───────────────────────────────────────────────────────────────
+    PIXTRAL_LARGE_2502  = "us.mistral.pixtral-large-2502-v1:0"
+
+    # ── Stability AI ─────────────────────────────────────────────────────────
+    STABLE_DIFFUSION_3_5_LARGE = "stability.sd3-5-large-v1:0"
+
+
+# Models that do NOT support both temperature and top_p simultaneously.
+# For these, only temperature will be sent in inferenceConfig.
+_TEMPERATURE_ONLY_MODELS = {
+    Model.CLAUDE_SONNET_4_6,
+    Model.CLAUDE_OPUS_4_6,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# *** SWAP HERE — change to any Model.* value to switch the active model ***
+# ─────────────────────────────────────────────────────────────────────────────
+ACTIVE_MODEL: Model = Model.LLAMA4_MAVERICK_17B
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Request / Response dataclasses
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class LLMRequest:
+    """Encapsulates a single text inference request."""
+    prompt: str
+    system_prompt: Optional[str] = None
+    max_tokens: int = 2048
+    temperature: float = 0.7
+    top_p: float = 0.9
+
+
+@dataclass
+class LLMResponse:
+    """Normalised response from any text model."""
+    model_id: str
+    text: Optional[str] = None
+    raw: Optional[dict] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def display(self):
+        """Render the response in the notebook."""
+        if self.text:
+            display(Markdown(self.text))
+        token_info = (
+            f"\n---\n*Model:* `{self.model_id}` | "
+            f"*Input tokens:* {self.input_tokens} | "
+            f"*Output tokens:* {self.output_tokens}"
+        )
+        display(Markdown(token_info))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BedrockLLMClient:
+    """
+    Unified text-only client for Amazon Bedrock foundation models.
+
+    Usage
+    -----
+    client = BedrockLLMClient()                         # uses ACTIVE_MODEL
+    client = BedrockLLMClient(model=Model.NOVA_PRO)     # explicit model
+    response = client.invoke(LLMRequest(prompt="Hello!"))
+    response.display()
+    """
+
+    def __init__(self, model: Model = ACTIVE_MODEL):
+        self.model = model
+        self.region = boto3.Session().region_name
+        self._bedrock = boto3.client("bedrock-runtime", region_name=self.region)
+
+    def _build_inference_config(self, request: LLMRequest) -> dict:
+        """
+        Build inferenceConfig respecting per-model parameter constraints.
+
+        Anthropic Claude models (and others in _TEMPERATURE_ONLY_MODELS) reject
+        requests that specify both `temperature` and `top_p` simultaneously.
+        For those models only `temperature` is sent; `top_p` is omitted.
+        """
+        cfg: dict[str, Any] = {"maxTokens": request.max_tokens}
+
+        if self.model in _TEMPERATURE_ONLY_MODELS:
+            # Claude: send only temperature — top_p is not allowed alongside it
+            cfg["temperature"] = request.temperature
+        else:
+            cfg["temperature"] = request.temperature
+            cfg["topP"] = request.top_p
+
+        return cfg
+
+    def invoke(self, request: LLMRequest) -> LLMResponse:
+        """Send a text prompt via the Converse API."""
+        messages = [{"role": "user", "content": [{"text": request.prompt}]}]
+        inference_cfg = self._build_inference_config(request)
+
+        kwargs: dict[str, Any] = {
+            "modelId": self.model.value,
+            "messages": messages,
+            "inferenceConfig": inference_cfg,
+        }
+        if request.system_prompt:
+            kwargs["system"] = [{"text": request.system_prompt}]
+
+        try:
+            raw = self._bedrock.converse(**kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bedrock converse call failed for model '{self.model.value}': {exc}"
+            ) from exc
+
+        output_msg = raw.get("output", {}).get("message", {})
+        text_parts = [
+            blk["text"]
+            for blk in output_msg.get("content", [])
+            if "text" in blk
+        ]
+        usage = raw.get("usage", {})
+        return LLMResponse(
+            model_id=self.model.value,
+            text="\n".join(text_parts),
+            raw=raw,
+            input_tokens=usage.get("inputTokens", 0),
+            output_tokens=usage.get("outputTokens", 0),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience helper — single function call interface
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ask(
+    prompt: str,
+    *,
+    model: Model = ACTIVE_MODEL,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 2048,
+    temperature: float = 0.7,
+    auto_display: bool = True,
+) -> LLMResponse:
+    """
+    One-liner text inference call.
+
+    Parameters
+    ----------
+    prompt        : Your text prompt / question.
+    model         : Override the active model (Model.* enum value).
+    system_prompt : Optional system instruction.
+    max_tokens    : Maximum output tokens.
+    temperature   : Sampling temperature (0–1).
+    auto_display  : Automatically render the response in the notebook.
+
+    Returns
+    -------
+    LLMResponse object (always returned regardless of auto_display).
+
+    Examples
+    --------
+    # Uses ACTIVE_MODEL
+    response = ask("Explain quantum entanglement in simple terms.")
+
+    # Override model inline
+    response = ask("Write a haiku.", model=Model.NOVA_MICRO)
+    """
+    client = BedrockLLMClient(model=model)
+    req = LLMRequest(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    response = client.invoke(req)
+    if auto_display:
+        response.display()
+    return response
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick-start demo  (comment out or delete after testing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+print(f"✅ BedrockLLMClient ready.  Active model → {ACTIVE_MODEL.value}\n")
+print("Available models:")
+for m in Model:
+    marker = " ◀ ACTIVE" if m == ACTIVE_MODEL else ""
+    print(f"  Model.{m.name:<30} {m.value}{marker}")
+
+print("\n─── Running a quick test with the active model ───")
+_ = ask("In one sentence, what is Amazon Bedrock?")
+
+
+
+
+
+from pypdf import PdfReader
+
+def get_pdf_text(pdf_path):
+    # Load the PDF file
+    reader = PdfReader(pdf_path)
+
+    # Extract text from all pages
+    extracted_text = []
+    for page_num, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text:
+            extracted_text.append(f"\n{text}")
+
+    # Join all pages into a single string
+    return("\n\n".join(extracted_text))
+
+legislation_full_text = get_pdf_text("C2025C00647.pdf")
+johnny_english_text = get_pdf_text("johnny_english.pdf")
+austin_powers_text = get_pdf_text("austin_powers_script.pdf")
+barbie_text = get_pdf_text("barbie_script.pdf")
+team_america = get_pdf_text("team_america.pdf")
+# Preview the first 2000 characters
+print(f"legislation_full_text: {len(legislation_full_text)}")
+print(f"johnny_english_text: {len(johnny_english_text)}")
+print(f"austin_powers_text: {len(austin_powers_text)}")
+print(f"barbie_text: {len(barbie_text)}")
+print(f"team_america: {len(team_america)}")
+
+
+
+
+
+import requests
+import boto3
+import io
+import time
+
+# --- Download the PDF from a public URL ---
+url = "https://www.afp.gov.au/sites/default/files/2023-12/MinisterialDirection2023.pdf"  # Replace with your PDF URL
+
+response = requests.get(url)
+response.raise_for_status()
+pdf_bytes = response.content
+
+# --- Use Amazon Textract to extract text from a flattened/image-based PDF ---
+# Textract works on PDFs stored in S3, so we upload it to S3 first,
+# then start an async Textract job.
+
+region = boto3.Session().region_name
+s3_client = boto3.client("s3", region_name=region)
+textract_client = boto3.client("textract", region_name=region)
+
+# Retrieve the default project S3 bucket
+from sagemaker_studio import Project
+proj = Project()
+s3_root = proj.s3.root  # e.g. s3://my-bucket/my-prefix
+
+# Parse bucket and prefix from s3_root
+s3_root_stripped = s3_root.replace("s3://", "")
+bucket_name = s3_root_stripped.split("/")[0]
+prefix = "/".join(s3_root_stripped.split("/")[1:]).rstrip("/")
+
+s3_key = f"{prefix}/textract_input/MinisterialDirection2023.pdf"
+
+# Upload PDF to S3
+s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=pdf_bytes)
+
+# Start Textract async document text detection
+start_response = textract_client.start_document_text_detection(
+    DocumentLocation={
+        "S3Object": {
+            "Bucket": bucket_name,
+            "Name": s3_key
+        }
+    }
+)
+job_id = start_response["JobId"]
+
+# Poll until the job completes
+print(f"Textract job started: {job_id}")
+while True:
+    result = textract_client.get_document_text_detection(JobId=job_id)
+    status = result["JobStatus"]
+    if status in ("SUCCEEDED", "FAILED"):
+        break
+    time.sleep(5)
+
+if status == "FAILED":
+    raise RuntimeError(f"Textract job failed: {result.get('StatusMessage', 'Unknown error')}")
+
+# Collect all pages of results (Textract paginates via NextToken)
+blocks = result["Blocks"]
+next_token = result.get("NextToken")
+while next_token:
+    paginated = textract_client.get_document_text_detection(JobId=job_id, NextToken=next_token)
+    blocks.extend(paginated["Blocks"])
+    next_token = paginated.get("NextToken")
+
+# Extract text from LINE blocks, preserving reading order
+ministers_direction_text = "\n".join(
+    block["Text"]
+    for block in blocks
+    if block["BlockType"] == "LINE"
+)
+
+# Preview the first 2000 characters
+ministers_direction_text[:2000]
+
+
+
+
+ask(f"""I will provide 2 pieces of text - the legislation for the AFP and the script of a movie.
+----------
+Legislation:
+{legislation_full_text}
+----------
+Movie script:
+{johnny_english_text}
+----------
+Can you provide suggestions for how the characters could have acted differently to align better with the AFP legislation?
+Provide specific examples from the movie script and the legislation
+Give each character a score out of 10 as to how well they complied with the AFP legislation
+""",
+model=Model.NOVA_PRO)
+
