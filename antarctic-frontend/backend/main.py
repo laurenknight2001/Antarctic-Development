@@ -1,6 +1,8 @@
 import os
 import time
+import random
 import boto3
+from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
@@ -18,7 +20,11 @@ app.add_middleware(
 MODEL_ID = os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-sonnet-4-6")
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 
-bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=REGION,
+    config=BotoConfig(read_timeout=600, retries={"max_attempts": 0}),
+)
 
 LEGISLATION_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -27,6 +33,16 @@ LEGISLATION_PATH = os.path.join(
     "scripts",
     "Australian-Federal-Police-Act-Australia-1979.pdf",
 )
+
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results")
+
+FAKE_RESULTS_MAP = {
+    "barbie_script.pdf": "barbie_results.pdf",
+    "johnny_english.pdf": "johnny_english_results.pdf",
+    "austin_powers_script.pdf": "austin_powers_results.pdf",
+    "team_america.pdf": "team_america_results.pdf",
+    "brooklyn_99.pdf": "brooklyn_99_results.pdf",
+}
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
@@ -48,32 +64,72 @@ def get_legislation_text() -> str:
 
 
 def call_bedrock(prompt: str, max_tokens: int = 4096) -> dict:
-    response = bedrock.converse(
+    response = bedrock.converse_stream(
         modelId=MODEL_ID,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         inferenceConfig={"maxTokens": max_tokens, "temperature": 0.7},
     )
-    output_msg = response.get("output", {}).get("message", {})
-    text_parts = [
-        block["text"]
-        for block in output_msg.get("content", [])
-        if "text" in block
-    ]
-    usage = response.get("usage", {})
+    text_parts = []
+    input_tokens = 0
+    output_tokens = 0
+    for event in response.get("stream", []):
+        if "contentBlockDelta" in event:
+            delta = event["contentBlockDelta"].get("delta", {})
+            if "text" in delta:
+                text_parts.append(delta["text"])
+        elif "metadata" in event:
+            usage = event["metadata"].get("usage", {})
+            input_tokens = usage.get("inputTokens", 0)
+            output_tokens = usage.get("outputTokens", 0)
     return {
-        "text": "\n".join(text_parts),
+        "text": "".join(text_parts),
         "model": MODEL_ID,
-        "input_tokens": usage.get("inputTokens", 0),
-        "output_tokens": usage.get("outputTokens", 0),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
     }
 
 
 @app.post("/api/analyze")
-async def analyze(file: UploadFile = File(...)):
+def analyze(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a PDF file.")
 
-    file_bytes = await file.read()
+    filename = file.filename
+    results_filename = FAKE_RESULTS_MAP.get(filename)
+
+    if not results_filename:
+        raise HTTPException(
+            400,
+            f"No pre-generated results for '{filename}'. "
+            f"Supported scripts: {', '.join(FAKE_RESULTS_MAP.keys())}",
+        )
+
+    results_path = os.path.normpath(os.path.join(RESULTS_DIR, results_filename))
+    if not os.path.exists(results_path):
+        raise HTTPException(
+            404,
+            f"Results file not found: {results_filename}",
+        )
+
+    with open(results_path, "rb") as f:
+        text = extract_pdf_text(f.read())
+
+    time.sleep(random.uniform(1, 3))
+
+    return {
+        "text": text,
+        "model": MODEL_ID,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+
+
+@app.post("/api/analyze_real")
+def analyze_real(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Please upload a PDF file.")
+
+    file_bytes = file.file.read()
     movie_text = extract_pdf_text(file_bytes)
 
     if not movie_text.strip():

@@ -61,9 +61,12 @@ function reset() {
 
 <template>
   <div class="app">
-    <header>
-      <h1>AFP Compliance Analyzer</h1>
-      <p class="subtitle">Drop a movie script PDF and get an AFP legislation compliance analysis</p>
+    <header style="display: flex; align-items: center; justify-content: center; gap: 1rem;">
+      <img src="https://searchvectorlogo.com/wp-content/uploads/2020/03/australian-federal-police-afp-logo-vector.png" style="width: 180px; height: 100px;" />
+      <div>
+        <h1>Compliance Analyser</h1>
+        <p class="subtitle">Drop a movie script PDF and get an AFP legislation compliance analysis</p>
+      </div>
     </header>
 
     <main>
@@ -95,7 +98,7 @@ function reset() {
       <!-- File selected -->
       <div v-if="file && !result && !loading" class="file-info">
         <p><strong>Selected:</strong> {{ file.name }}</p>
-        <button class="btn primary" @click="analyze">Analyze Compliance</button>
+        <button class="btn primary" @click="analyze">Analyse Compliance</button>
       </div>
 
       <!-- Loading -->
